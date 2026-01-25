@@ -1,0 +1,65 @@
+# gamdl configuration for Apple Music downloads
+# SETUP: Copy this file to gamdl.toml and add your cookies.txt
+
+[DEFAULT]
+# Path to cookies file (relative to project root)
+cookies_path = config/cookies.txt
+
+# Output directory (relative to where gamdl is run)
+output_path = music library
+
+# Metadata settings
+metadata_language = en-US
+song_codec = aac-legacy
+synced_lyrics = true
+synced_lyrics_format = lrc
+cover_size = 1200
+save_cover = true
+
+# File naming template
+final_path = {album_artist}/{album}/{track:02d} {title}
+
+[gamdl]
+log_level = INFO
+log_file = null
+no_exceptions = false
+language = en-US
+temp_path = .
+wvd_path = null
+overwrite = false
+save_playlist = false
+
+# External tools (install via brew or pip)
+nm3u8dlre_path = N_m3u8DL-RE
+mp4decrypt_path = mp4decrypt
+ffmpeg_path = ffmpeg
+mp4box_path = MP4Box
+
+# Download settings
+download_mode = ytdlp
+remux_mode = ffmpeg
+cover_format = jpg
+
+# Folder templates
+album_folder_template = {album_artist}/{album}
+compilation_folder_template = Compilations/{album}
+no_album_folder_template = {artist}/Unknown Album
+single_disc_file_template = {track:02d} {title}
+multi_disc_file_template = {disc}-{track:02d} {title}
+no_album_file_template = {title}
+playlist_file_template = Playlists/{playlist_artist}/{playlist_title}
+
+# Tag settings
+date_tag_template = %Y-%m-%dT%H:%M:%SZ
+exclude_tags = null
+truncate = null
+no_synced_lyrics = false
+synced_lyrics_only = false
+
+# Video settings (for music videos)
+music_video_codec_priority = h264,h265
+music_video_remux_format = m4v
+music_video_resolution = 1080p
+uploaded_video_quality = best
+use_album_date = false
+fetch_extra_tags = false

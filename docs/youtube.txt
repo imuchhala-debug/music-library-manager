@@ -1,0 +1,18 @@
+YOUTUBE / SOUNDCLOUD 
+======================================
+
+Run this command in Terminal:
+
+  cd /path/to/music-library-manager
+  yt-dlp --config-location config/yt-dlp.conf "PASTE_URL_HERE"
+
+For YouTube (requires Chrome to be open):
+
+  yt-dlp --cookies-from-browser chrome --config-location config/yt-dlp.conf "YOUTUBE_URL"
+
+Examples:
+  - YouTube:    https://www.youtube.com/watch?v=...
+  - SoundCloud: https://soundcloud.com/artist/track
+  - Bandcamp:   https://artist.bandcamp.com/track/...
+
+Files download to: music library/Artist/Album/

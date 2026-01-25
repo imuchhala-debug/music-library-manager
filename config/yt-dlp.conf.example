@@ -1,0 +1,27 @@
+# yt-dlp config for SoundCloud/YouTube downloads
+# Integrates with gamdl folder structure
+#
+# SETUP: Copy this file to yt-dlp.conf and update the path below
+
+# Output to same music library folder as gamdl
+# UPDATE THIS PATH to your music library location:
+-o "~/Music/music library/%(uploader)s/%(playlist_title|album|title)s/%(playlist_index)02d %(title)s.%(ext)s"
+
+# Audio only
+-x
+--audio-format mp3
+--audio-quality 0
+
+# Embed metadata and artwork
+--embed-thumbnail
+--embed-metadata
+--add-metadata
+
+# Convert thumbnail to jpg for compatibility
+--convert-thumbnails jpg
+
+# Don't overwrite existing files
+--no-overwrites
+
+# Ignore errors and continue
+--ignore-errors

@@ -1,0 +1,29 @@
+# Music library (large files)
+music library/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Cookies and credentials (sensitive)
+config/cookies.txt
+config/cookies-yt.txt
+config/cookies/
+
+# Actual config files (use .example versions)
+config/gamdl.toml
+config/yt-dlp.conf
+
+# Temporary files
+*.part
+*.ytdl
+*_temp_*/
+
+# IDE
+.vscode/
+*.code-workspace

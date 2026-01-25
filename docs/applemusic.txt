@@ -1,0 +1,15 @@
+APPLE MUSIC
+=============================
+
+Run this command in Terminal:
+
+  cd /path/to/music-library-manager
+  gamdl --config-path config/gamdl.toml "URL"
+
+Examples:
+  - Song:     https://music.apple.com/us/song/...
+  - Album:    https://music.apple.com/us/album/...
+  - Playlist: https://music.apple.com/us/playlist/...
+  - Artist:   https://music.apple.com/us/artist/...
+
+Files download to: music library/Artist/Album/

@@ -1,0 +1,4 @@
+gamdl>=1.0.0
+spotdl>=4.0.0
+yt-dlp>=2024.0.0
+requests>=2.28.0
