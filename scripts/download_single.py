@@ -69,17 +69,8 @@ def check_docker():
     colima = _find_bin("colima")
     try:
         result = subprocess.run(
-            [
-                docker,
-                "ps",
-                "--filter",
-                "name=wrapper-manager",
-                "--format",
-                "{{.Status}}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
+            [docker, "ps", "--filter", "name=wrapper-manager", "--format", "{{.Status}}"],
+            capture_output=True, text=True, timeout=5,
         )
         if "Up" in result.stdout:
             return True
@@ -87,14 +78,8 @@ def check_docker():
         pass
     emit("info", message="Starting download service...")
     try:
-        subprocess.run(
-            [colima, "start", "--cpu", "2", "--memory", "4"],
-            capture_output=True,
-            timeout=60,
-        )
-        subprocess.run(
-            [docker, "start", "wrapper-manager"], capture_output=True, timeout=15
-        )
+        subprocess.run([colima, "start", "--cpu", "2", "--memory", "4"], capture_output=True, timeout=60)
+        subprocess.run([docker, "start", "wrapper-manager"], capture_output=True, timeout=15)
         return True
     except Exception as e:
         emit("error", message=f"Could not start download service: {e}")
@@ -365,6 +350,21 @@ def preview_spotify(url):
             raw_items = tracks_obj.get("items", []) if isinstance(tracks_obj, dict) else []
             total_tracks = tracks_obj.get("total", 0) if isinstance(tracks_obj, dict) else 0
 
+            # Spotify dev mode often returns tracks=None; scrape real total from page
+            if not total_tracks:
+                try:
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    og_req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(og_req, timeout=10, context=ctx) as og_resp:
+                        og_html = og_resp.read().decode("utf-8", errors="replace")
+                    og_match = re.search(r'<meta property="og:description" content="[^"]*?(\d+)\s+items', og_html)
+                    if og_match:
+                        total_tracks = int(og_match.group(1))
+                except Exception:
+                    pass
+
             tracks = []
             if raw_items:
                 for i, item in enumerate(raw_items[:50], 1):
@@ -383,7 +383,8 @@ def preview_spotify(url):
                 from utils import fetch_playlist_tracks_from_embed
 
                 embed_tracks = fetch_playlist_tracks_from_embed(playlist_id)
-                total_tracks = len(embed_tracks)
+                if not total_tracks:
+                    total_tracks = len(embed_tracks)
                 for i, et in enumerate(embed_tracks[:50], 1):
                     dur_ms = et.get("duration_ms", 0)
                     mins = dur_ms // 60000
@@ -468,10 +469,154 @@ def download_spotify(
 # MARK: - Download
 
 
-def download_apple_music(url):
-    emit("info", message="Downloading from Apple Music (ALAC lossless)...")
+def _fetch_track_metadata(track_url):
+    """Look up (title, artist) for an Apple Music song URL via iTunes API.
+    Song URLs contain `?i=<adam_id>`; album URLs don't. Returns None if not a song URL or if
+    lookup fails.
+    """
+    m = re.search(r"[?&]i=(\d+)", track_url)
+    if not m:
+        return None
+    song_id = m.group(1)
+    lookup_url = f"https://itunes.apple.com/lookup?id={song_id}"
+    try:
+        ctx = ssl.create_default_context()
+        req = urllib.request.Request(lookup_url, headers={"User-Agent": "Vinyl/1.0"})
+        with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
+            data = json.loads(resp.read())
+        if data.get("resultCount", 0) > 0:
+            r = data["results"][0]
+            return {
+                "url": track_url,
+                "title": r.get("trackName", ""),
+                "artist": r.get("artistName", ""),
+            }
+    except Exception:
+        pass
+    return None
 
-    cmd = [_find_bin("poetry"), "run", "python", "batch_download.py", url]
+
+def _itunes_lookup(lookup_id):
+    try:
+        ctx = ssl.create_default_context()
+        req = urllib.request.Request(
+            f"https://itunes.apple.com/lookup?id={lookup_id}",
+            headers={"User-Agent": "Vinyl/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
+            data = json.loads(resp.read())
+    except Exception:
+        return None
+    if data.get("resultCount", 0) == 0:
+        return None
+    return data["results"][0]
+
+
+def _fetch_artwork(url):
+    """Resolve album cover art via iTunes API for either a song URL (?i=<id>) or an
+    album URL (/album/.../<id>). Returns {"artwork_url", "artist", "album"} or None.
+    Used to populate the download row thumbnail before any track downloads.
+    Song-ID lookup is tried first; falls back to album-ID from the URL if empty.
+    """
+    candidate_ids = []
+    song_m = re.search(r"[?&]i=(\d+)", url)
+    if song_m:
+        candidate_ids.append(song_m.group(1))
+    album_m = re.search(r"/album/[^/]*/(\d+)", url) or re.search(r"/album/(\d+)", url)
+    if album_m:
+        candidate_ids.append(album_m.group(1))
+    for lookup_id in candidate_ids:
+        r = _itunes_lookup(lookup_id)
+        if not r:
+            continue
+        art = r.get("artworkUrl100") or r.get("artworkUrl60")
+        if not art:
+            continue
+        art = art.replace("100x100bb", "600x600bb").replace("100x100", "600x600")
+        return {
+            "artwork_url": art,
+            "artist": r.get("artistName") or r.get("collectionArtistName"),
+            "album": r.get("collectionName") or r.get("trackName"),
+        }
+    return None
+
+
+def _normalize_failure_reason(raw):
+    """Map a batch_download log excerpt to a normalized failure-reason token.
+    Swift maps this to human-readable text. Raw message is preserved in `detail`.
+    """
+    low = raw.lower()
+    if "not found" in low or "not available" in low or "no such song" in low:
+        return "not_found"
+    if "integrity" in low:
+        return "integrity_check"
+    if "no active subscription" in low or "no subscription" in low:
+        return "no_subscription"
+    if "region" in low and ("locked" in low or "not available" in low):
+        return "region_locked"
+    if "no available instance" in low or "wrapper" in low:
+        return "no_wrapper"
+    if "decrypt" in low or "m3u8" in low or "stream" in low:
+        return "decrypt_failed"
+    return "other"
+
+
+def download_apple_music(urls, drive_path=None):
+    """Download one or more Apple Music URLs. Accepts a string or list of strings."""
+    if isinstance(urls, str):
+        urls = [urls]
+    emit("info", message=f"Downloading {len(urls)} item(s) from Apple Music (ALAC lossless)...")
+
+    # Emit artwork early so the Swift download row can show real cover art instead of
+    # a placeholder. First URL that resolves wins (playlists fall back to first track's album).
+    for u in urls:
+        art = _fetch_artwork(u)
+        if art:
+            emit(
+                "album_metadata",
+                url=u,
+                artwork_url=art["artwork_url"],
+                artist=art.get("artist"),
+                album=art.get("album"),
+            )
+            break
+
+    # Update config.toml output path if a custom drive path is provided
+    if drive_path:
+        config_path = AMD_DIR / "config.toml"
+        try:
+            lines = config_path.read_text().splitlines()
+            new_lines = []
+            for line in lines:
+                if line.strip().startswith("dirPathFormat") and "playlist" not in line.lower():
+                    new_lines.append(f'dirPathFormat = "{drive_path}/{{album_artist}}/{{album}}"')
+                elif line.strip().startswith("playlistDirPathFormat"):
+                    new_lines.append(f'playlistDirPathFormat = "{drive_path}/Playlists/{{playlistName}}"')
+                else:
+                    new_lines.append(line)
+            config_path.write_text("\n".join(new_lines) + "\n")
+        except Exception as e:
+            emit("warning", message=f"Could not update config path: {e}")
+
+    # Pre-fetch per-track metadata so we can emit `track_queued` up-front and maintain a mapping
+    # from the "Artist - Title" key emitted in batch_download logs back to the source URL. Album
+    # URLs (no `?i=` param) are skipped here; their songs surface via log events without URLs.
+    meta_by_key = {}
+    meta_by_url = {}
+    for u in urls:
+        meta = _fetch_track_metadata(u)
+        if meta:
+            key = f"{meta['artist']} - {meta['title']}".lower()
+            meta_by_key[key] = meta
+            meta_by_url[u] = meta
+            emit("track_queued", url=meta["url"], track=meta["title"], artist=meta["artist"])
+
+    def _url_for(song_tag):
+        """song_tag is the "Artist - Title" string captured from batch_download logs."""
+        m = meta_by_key.get(song_tag.lower())
+        return (m or {}).get("url", "")
+
+    cmd = [_find_bin("poetry"), "run", "python", "batch_download.py"] + urls
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -481,33 +626,73 @@ def download_apple_music(url):
     )
 
     saved_files = []
+    started_keys = set()
+    terminal_keys = set()  # saved, skipped, or failed
     for line in proc.stdout:
         line = line.strip()
         if "Start ripping" in line:
             match = re.search(r"SONG \| (.+?) \| INFO - Start ripping", line)
             if match:
-                emit("downloading", track=match.group(1))
+                tag = match.group(1)
+                started_keys.add(tag.lower())
+                emit("downloading", track=tag)
+                emit("track_downloading", url=_url_for(tag), track=tag)
             match = re.search(r"ALBUM \| (.+?) \| INFO - Start ripping", line)
             if match:
                 emit("downloading", album=match.group(1))
         elif "Selected codec" in line:
             match = re.search(r"SONG \| (.+?) \| INFO - Selected codec: (.+)", line)
             if match:
-                emit("decrypting", track=match.group(1), codec=match.group(2))
+                tag = match.group(1)
+                emit("decrypting", track=tag, codec=match.group(2))
         elif "Song saved" in line:
             match = re.search(r"SONG \| (.+?) \| SUCCESS", line)
             if match:
-                emit("saved", track=match.group(1))
-                saved_files.append(match.group(1))
+                tag = match.group(1)
+                terminal_keys.add(tag.lower())
+                emit("saved", track=tag)
+                emit("track_saved", url=_url_for(tag), track=tag)
+                saved_files.append(tag)
         elif "already exist" in line:
             match = re.search(r"SONG \| (.+?) \| INFO - Song already", line)
             if match:
-                emit("skipped", track=match.group(1))
+                tag = match.group(1)
+                terminal_keys.add(tag.lower())
+                emit("skipped", track=tag)
+                emit("track_skipped", url=_url_for(tag), track=tag)
         elif "Error" in line or "error" in line.lower():
-            if "fork_posix" not in line and "WARNING" not in line:
+            if "fork_posix" in line or "WARNING" in line:
+                continue
+            # Per-song error: "SONG | Artist - Title | ERROR - message"
+            per_song = re.search(r"SONG \| (.+?) \| ERROR - (.+)", line)
+            if per_song:
+                tag = per_song.group(1)
+                raw_reason = per_song.group(2)
+                terminal_keys.add(tag.lower())
+                reason = _normalize_failure_reason(raw_reason)
+                emit("warning", message=f"Error processing song | {tag} | {raw_reason}"[:200])
+                emit("track_failed", url=_url_for(tag), track=tag,
+                     reason=reason, detail=raw_reason[:200])
+            else:
                 emit("warning", message=line[:200])
 
     proc.wait()
+
+    # Surface tracks that were pre-queued but never terminated. Two buckets:
+    #   started-but-not-finished  → decrypt_failed (mid-stream crash)
+    #   never-started             → no_wrapper     (queue never reached them)
+    for key, meta in meta_by_key.items():
+        if key in terminal_keys:
+            continue
+        if key in started_keys:
+            emit("track_failed", url=meta["url"], track=meta["title"],
+                 reason="decrypt_failed",
+                 detail="Track started but did not complete before batch exited.")
+        else:
+            emit("track_failed", url=meta["url"], track=meta["title"],
+                 reason="no_wrapper",
+                 detail="Track was queued but the batch never processed it.")
+
     return saved_files
 
 
@@ -552,7 +737,7 @@ def download_youtube(url, artist, album):
 
 def main():
     parser = argparse.ArgumentParser(description="MusicDrop download bridge")
-    parser.add_argument("url", help="Apple Music or YouTube URL")
+    parser.add_argument("urls", nargs="+", help="Apple Music, Spotify, or YouTube URL(s)")
     parser.add_argument("--artist", help="Artist name (for YouTube)")
     parser.add_argument("--album", help="Album name (for YouTube)")
     parser.add_argument(
@@ -567,41 +752,59 @@ def main():
     args = parser.parse_args()
 
     if args.preview:
-        if is_apple_music(args.url):
-            preview_apple_music(args.url)
-        elif is_spotify(args.url):
-            preview_spotify(args.url)
-        elif is_youtube(args.url):
-            preview_youtube(args.url)
+        url = args.urls[0]
+        if is_apple_music(url):
+            preview_apple_music(url)
+        elif is_spotify(url):
+            preview_spotify(url)
+        elif is_youtube(url):
+            preview_youtube(url)
         else:
             emit("error", message="Unsupported URL")
         return
 
     # Pre-checks
     check_drive(args.drive_path)
-    if is_apple_music(args.url):
+
+    # Separate URLs by type
+    am_urls = [u for u in args.urls if is_apple_music(u)]
+    spotify_urls = [u for u in args.urls if is_spotify(u)]
+    youtube_urls = [u for u in args.urls if is_youtube(u)]
+    unknown_urls = [u for u in args.urls if u not in am_urls + spotify_urls + youtube_urls]
+
+    if unknown_urls:
+        emit("error", message=f"Unsupported URL(s): {', '.join(unknown_urls[:3])}")
+        sys.exit(1)
+
+    # Apple Music batch
+    if am_urls:
         if not check_docker():
             sys.exit(1)
+        saved = download_apple_music(am_urls, args.drive_path)
+        if saved:
+            emit("complete", source="apple_music", tracks_saved=len(saved))
+        else:
+            emit("error", message="No tracks downloaded. Check config.toml and QEMU service.")
+            sys.exit(1)
 
-    # Download
-    if is_apple_music(args.url):
-        saved = download_apple_music(args.url)
-        emit("complete", source="apple_music", tracks_saved=len(saved))
-    elif is_spotify(args.url):
-        saved = download_spotify(args.url, args.artist, args.album, args.drive_path)
-        emit("complete", source="spotify", tracks_saved=len(saved))
-    elif is_youtube(args.url):
+    # Spotify (single URL)
+    for url in spotify_urls:
+        saved = download_spotify(url, args.artist, args.album, args.drive_path)
+        if saved:
+            emit("complete", source="spotify", tracks_saved=len(saved))
+        else:
+            emit("error", message="No tracks downloaded")
+
+    # YouTube (single URL)
+    for url in youtube_urls:
         if not args.artist or not args.album:
             emit("error", message="YouTube downloads require --artist and --album")
             sys.exit(1)
-        saved = download_youtube(args.url, args.artist, args.album)
-        emit("complete", source="youtube", tracks_saved=len(saved))
-    else:
-        emit(
-            "error",
-            message="Unsupported URL. Use Apple Music, Spotify, or YouTube links.",
-        )
-        sys.exit(1)
+        saved = download_youtube(url, args.artist, args.album)
+        if saved:
+            emit("complete", source="youtube", tracks_saved=len(saved))
+        else:
+            emit("error", message="No tracks downloaded")
 
 
 if __name__ == "__main__":
