@@ -581,7 +581,10 @@ def download_apple_music(urls, drive_path=None):
             )
             break
 
-    # Update config.toml output path if a custom drive path is provided
+    # Update config.toml output path if a custom drive path is provided.
+    # Playlist tracks go into the same {album_artist}/{album} folders as regular album
+    # downloads so Vinyl's library scanner sees them with correct artist/album (folder
+    # structure is canonical). Vinyl tracks playlist membership via playlists.json.
     if drive_path:
         config_path = AMD_DIR / "config.toml"
         try:
@@ -591,12 +594,28 @@ def download_apple_music(urls, drive_path=None):
                 if line.strip().startswith("dirPathFormat") and "playlist" not in line.lower():
                     new_lines.append(f'dirPathFormat = "{drive_path}/{{album_artist}}/{{album}}"')
                 elif line.strip().startswith("playlistDirPathFormat"):
-                    new_lines.append(f'playlistDirPathFormat = "{drive_path}/Playlists/{{playlistName}}"')
+                    new_lines.append(f'playlistDirPathFormat = "{drive_path}/{{album_artist}}/{{album}}"')
+                elif line.strip().startswith("playlistSongNameFormat"):
+                    new_lines.append('playlistSongNameFormat = "{disk}-{tracknum:02d} {title}"')
                 else:
                     new_lines.append(line)
             config_path.write_text("\n".join(new_lines) + "\n")
         except Exception as e:
             emit("warning", message=f"Could not update config path: {e}")
+
+    # Detect playlist URL → remember name + start time so we can emit all saved paths
+    # at batch end. Vinyl uses this to create a Playlist record pointing at the saved tracks.
+    import time
+    batch_start = time.time()
+    playlist_name = None
+    for u in urls:
+        m = re.search(r"/playlist/([^/]+)/pl\.", u)
+        if m:
+            slug = urllib.parse.unquote(m.group(1))
+            # Convert URL slug "my-chill-vibes" → "my chill vibes"; leave all-lowercase since
+            # real names often are (e.g. "scaping"). Vinyl can rename later.
+            playlist_name = slug.replace("-", " ")
+            break
 
     # Pre-fetch per-track metadata so we can emit `track_queued` up-front and maintain a mapping
     # from the "Artist - Title" key emitted in batch_download logs back to the source URL. Album
@@ -628,7 +647,33 @@ def download_apple_music(urls, drive_path=None):
     saved_files = []
     started_keys = set()
     terminal_keys = set()  # saved, skipped, or failed
+
+    # Stall watchdog: if no stdout activity for STALL_TIMEOUT seconds, kill the batch.
+    # Protects against wrapper-manager m3u8→decrypt hangs where batch_download.py blocks
+    # on gRPC forever and never exits — leaving Vinyl's queue deadlocked.
+    import threading
+    STALL_TIMEOUT = 120.0
+    last_event = [time.time()]
+    stall_triggered = [False]
+
+    def watchdog():
+        while proc.poll() is None:
+            time.sleep(5)
+            if time.time() - last_event[0] > STALL_TIMEOUT:
+                stall_triggered[0] = True
+                emit("warning", message=f"Download stalled — no progress for {int(STALL_TIMEOUT)}s. Killing batch.")
+                try:
+                    proc.terminate()
+                    time.sleep(5)
+                    if proc.poll() is None:
+                        proc.kill()
+                except Exception:
+                    pass
+                return
+    threading.Thread(target=watchdog, daemon=True).start()
+
     for line in proc.stdout:
+        last_event[0] = time.time()
         line = line.strip()
         if "Start ripping" in line:
             match = re.search(r"SONG \| (.+?) \| INFO - Start ripping", line)
@@ -678,13 +723,19 @@ def download_apple_music(urls, drive_path=None):
 
     proc.wait()
 
-    # Surface tracks that were pre-queued but never terminated. Two buckets:
+    # Surface tracks that were pre-queued but never terminated. Three buckets:
+    #   stall-triggered           → decrypt_stall  (watchdog killed the subprocess)
     #   started-but-not-finished  → decrypt_failed (mid-stream crash)
     #   never-started             → no_wrapper     (queue never reached them)
+    stall_detail = ("Download stalled for over 2 minutes and was terminated. "
+                    "Usually means the wrapper subprocess crashed or the decrypt hung.")
     for key, meta in meta_by_key.items():
         if key in terminal_keys:
             continue
-        if key in started_keys:
+        if stall_triggered[0] and key in started_keys:
+            emit("track_failed", url=meta["url"], track=meta["title"],
+                 reason="decrypt_stall", detail=stall_detail)
+        elif key in started_keys:
             emit("track_failed", url=meta["url"], track=meta["title"],
                  reason="decrypt_failed",
                  detail="Track started but did not complete before batch exited.")
@@ -692,6 +743,23 @@ def download_apple_music(urls, drive_path=None):
             emit("track_failed", url=meta["url"], track=meta["title"],
                  reason="no_wrapper",
                  detail="Track was queued but the batch never processed it.")
+
+    # Playlist URL? Emit every .m4a written to drive_path during this batch so Vinyl can
+    # create a Playlist record pointing at them. Ordered by mtime (≈ playlist order since
+    # batch_download processes tracks sequentially). Skips files that pre-existed the batch.
+    if playlist_name and drive_path:
+        drive_root = Path(drive_path)
+        saved_paths = []
+        if drive_root.is_dir():
+            for p in drive_root.rglob("*.m4a"):
+                try:
+                    if p.stat().st_mtime >= batch_start:
+                        saved_paths.append((p.stat().st_mtime, str(p)))
+                except OSError:
+                    continue
+        saved_paths.sort(key=lambda x: x[0])
+        emit("playlist_complete", name=playlist_name,
+             paths=[p for _, p in saved_paths])
 
     return saved_files
 
