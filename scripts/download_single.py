@@ -761,7 +761,10 @@ def download_apple_music(urls, drive_path=None):
         emit("playlist_complete", name=playlist_name,
              paths=[p for _, p in saved_paths])
 
-    return saved_files
+    # `any_started` lets caller distinguish wrapper-down (zero "Start ripping" lines) from
+    # wrapper-side decrypt failure (started but didn't save). Vinyl maps the former to the
+    # re-auth sheet and the latter to a retry-this-album hint.
+    return saved_files, bool(started_keys)
 
 
 def download_youtube(url, artist, album):
@@ -848,11 +851,16 @@ def main():
     if am_urls:
         if not check_docker():
             sys.exit(1)
-        saved = download_apple_music(am_urls, args.drive_path)
+        saved, any_started = download_apple_music(am_urls, args.drive_path)
         if saved:
             emit("complete", source="apple_music", tracks_saved=len(saved))
         else:
-            emit("error", message="No tracks downloaded. Check config.toml and QEMU service.")
+            if not any_started:
+                emit("error", reason="no_wrapper",
+                     message="Wrapper service unavailable — re-authenticate Apple Music")
+            else:
+                emit("error", reason="decrypt_failed",
+                     message="Decrypt failed for all tracks — try again or restart Docker")
             sys.exit(1)
 
     # Spotify (single URL)
