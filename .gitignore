@@ -18,6 +18,23 @@ config/cookies/
 # Actual config files (use .example versions)
 config/gamdl.toml
 config/yt-dlp.conf
+config/spotify.json
+config/.spotify_token
+
+# Spotify/spotipy token cache (file or directory form)
+.cache
+.cache/
+
+# Personal data (not shared)
+config/album_urls.txt
+config/claude.txt
+config/music.txt
+
+# Nested external projects with their own git history
+AppleMusicDecrypt/
+Vinyl/
+wrapper/
+wrapper-manager/
 
 # Temporary files
 *.part
